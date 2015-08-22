@@ -15,7 +15,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-
+import argparse
 import collections
 import enum
 import logging
@@ -23,9 +23,8 @@ import json
 import os
 
 
-logging.basicConfig(level=logging.DEBUG)
+State = collections.namedtuple('State', ['pgrp', 'interval', 'charging'])
 
-State = collections.namedtuple('State', ['ppid', 'interval', 'charging'])
 
 class Interval(float, enum.Enum):
     CRITICAL = 1.30
@@ -40,8 +39,10 @@ def new(cls, m):
             return interval
     return Interval.NORMAL
 
+
 Interval.__new__ = new
 I = Interval
+
 
 def parse_line(line):
     line = line.strip().replace('POWER_SUPPLY_', '')
@@ -49,12 +50,11 @@ def parse_line(line):
     return key, int(value) if value.isdigit() else value
 
 
-
 STATE_FILE = '/tmp/battery.json'
 BATTERY_FILE = '/sys/class/power_supply/BAT0/uevent'
 DEFAULT_STATE = State(None, Interval.NORMAL, True)
 CMD = "i3-nagbar -m 'Less than %d minutes of battery remaining!' %s"
-PPID = os.getppid()
+PGRP = os.getpgrp()
 
 ACTIONS = dict(zip(Interval, [
     'pm-hibernate',
@@ -63,37 +63,72 @@ ACTIONS = dict(zip(Interval, [
 ]))
 
 
-try:
-    old_state = State(**json.load(open(STATE_FILE)))
-    if old_state.ppid != PPID:
-        logging.debug('PPID is different, discarding state')
+def main():
+    try:
+        old_state = State(**json.load(open(STATE_FILE)))
+        if old_state.pgrp != PGRP:
+            logging.debug('PGRP is different, discarding state')
+            old_state = DEFAULT_STATE
+    except (ValueError, OSError) as e:
         old_state = DEFAULT_STATE
-except (ValueError, OSError) as e:
-    old_state = DEFAULT_STATE
 
-logging.info('old state:%s', old_state)
+    logging.info('old state:%s', old_state)
 
-B = dict(map(parse_line, open(BATTERY_FILE)))
-for k in B:
-    logging.debug('%s:%s', k, B[k])
+    B = dict(map(parse_line, open(BATTERY_FILE)))
+    for k in B:
+        logging.debug('%s:%s', k, B[k])
 
 
-if B['STATUS'] == 'Discharging':
-    minutes = 60* (B['CHARGE_NOW']) / B['CURRENT_NOW']
-    logging.debug('minutes:%s', minutes)
-    new_state = State(PPID, Interval(minutes).value, False)
-    logging.info('new state:%s', new_state)
+    if B['STATUS'] == 'Discharging':
+        minutes = 60* (B['CHARGE_NOW']) / B['CURRENT_NOW']
+        logging.debug('minutes:%s', minutes)
+        new_state = State(PGRP, Interval(minutes).value, False)
+        logging.info('new state:%s', new_state)
 
-    if old_state.charging or new_state.interval < old_state.interval:
-        action = ACTIONS.get(new_state.interval)
-        logging.info(action)
-        os.system(action)
+        if old_state.charging or new_state.interval < old_state.interval:
+            action = ACTIONS.get(new_state.interval)
+            if action:
+                logging.info(action)
+                os.system(action)
+        else:
+            # do not allow battery level to increase when discharging.
+            logging.debug('state.interval has not decreased')
+            new_state = old_state
     else:
-        # do not allow battery level to increase when discharging.
-        logging.debug('state.interval has not decreased')
-        new_state = old_state
-else:
-    new_state = State(PPID, I.NORMAL.value, True)
-    logging.info('new state:%s', new_state)
+        new_state = State(PGRP, I.NORMAL.value, True)
+        logging.info('new state:%s', new_state)
 
-json.dump(vars(new_state), open(STATE_FILE, 'w'))
+    json.dump(vars(new_state), open(STATE_FILE, 'w'))
+
+
+
+
+parser = argparse.ArgumentParser(description='Battery Monitor')
+group = parser.add_mutually_exclusive_group()
+group.add_argument('-q', '--quiet', action='count', default=0,
+        help='decrease output verbosity')
+group.add_argument('-v', '--verbosity', action='count', default=0,
+        help='increase output verbosity')
+parser.add_argument('-l', '--log', metavar='FILE')
+parser.add_argument('-e', '--event', default='')
+
+
+class PidFilter(logging.Filter):
+
+    def filter(self, record):
+        record.pid = os.getpid()
+        record.pgrp = PGRP
+        return True
+
+
+if __name__ == '__main__':
+    args = parser.parse_args()
+
+    level = (4 + (args.quiet if args.quiet else -args.verbosity)) * 10
+    logging.basicConfig(level=level, filename=args.log,
+        format='[%(asctime)s] %(pgrp)s %(pid)s %(levelname)-8s %(message)s')
+    logger = logging.getLogger()
+    logger.addFilter(PidFilter())
+
+    # TODO: redirect stderr to logging error
+    main()
