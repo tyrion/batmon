@@ -21,6 +21,8 @@ import enum
 import logging
 import json
 import os
+import time
+import traceback
 
 
 State = collections.namedtuple('State', ['pgrp', 'interval', 'charging'])
@@ -63,7 +65,7 @@ ACTIONS = dict(zip(Interval, [
 ]))
 
 
-def main():
+def main(tries=2):
     try:
         old_state = State(**json.load(open(STATE_FILE)))
         if old_state.pgrp != PGRP:
@@ -80,7 +82,17 @@ def main():
 
 
     if B['STATUS'] == 'Discharging':
-        minutes = 60* (B['CHARGE_NOW']) / B['CURRENT_NOW']
+        try:
+            minutes = 60* (B['CHARGE_NOW']) / B['CURRENT_NOW']
+        except ZeroDivisionError:
+            logging.error('CURRENT_NOW is 0, could not compute remaining time')
+            if tries > 1:
+                logging.info('trying again in 5 seconds')
+                time.seelp(5)
+                return main(tries-1)
+            else:
+                logging.info('aborting')
+                return
         logging.debug('minutes:%s', minutes)
         new_state = State(PGRP, Interval(minutes).value, False)
         logging.info('new state:%s', new_state)
@@ -101,6 +113,15 @@ def main():
     json.dump(vars(new_state), open(STATE_FILE, 'w'))
 
 
+def log_exceptions(main):
+    try:
+        main()
+    except KeyboardInterrupt:
+        logging.info('received KeyboardInterrupt, terminating')
+        raise SystemExit
+    except:
+        for line in traceback.format_exc().splitlines():
+            logging.error(line)
 
 
 parser = argparse.ArgumentParser(description='Battery Monitor')
@@ -111,6 +132,8 @@ group.add_argument('-v', '--verbosity', action='count', default=0,
         help='increase output verbosity')
 parser.add_argument('-l', '--log', metavar='FILE')
 parser.add_argument('-e', '--event', default='')
+parser.add_argument('-p', '--poll', metavar='INTERVAL', nargs='?',
+        type=int, const=60)
 
 
 class PidFilter(logging.Filter):
@@ -130,5 +153,9 @@ if __name__ == '__main__':
     logger = logging.getLogger()
     logger.addFilter(PidFilter())
 
-    # TODO: redirect stderr to logging error
-    main()
+    if args.poll is None:
+        log_exceptions(main)
+    else:
+        while True:
+            log_exceptions(lambda: (main(), time.sleep(args.poll)))
+
